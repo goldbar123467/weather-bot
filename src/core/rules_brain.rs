@@ -140,11 +140,19 @@ impl Brain for RulesBrain {
                 )));
             }
 
+            // Liquidity filter — skip brackets with no real market activity
+            if ctx.market.volume_24h < 10 && ctx.market.open_interest < 10 {
+                return Ok(pass(&format!(
+                    "Net edge {:.1}pp on {:?} but illiquid: vol_24h={}, OI={}",
+                    net_edge * 100.0, side, ctx.market.volume_24h, ctx.market.open_interest
+                )));
+            }
+
             let reasoning = format!(
-                "Ensemble YES={:.0}% vs market={:.0}% → {:.1}pp net edge on {:?} (gross {:.1}pp - fee ~{:.1}pp, {:?} confidence). {}x @ {}¢.",
+                "Ensemble YES={:.0}% vs market={:.0}% → {:.1}pp net edge on {:?} (gross {:.1}pp - fee ~{:.1}pp, {:?} confidence). {}x @ {}¢. vol_24h={} OI={}",
                 ens_yes * 100.0, market_implied * 100.0,
                 net_edge * 100.0, side, adj_edge * 100.0, fee_pp * 100.0, weather.confidence,
-                shares, max_price,
+                shares, max_price, ctx.market.volume_24h, ctx.market.open_interest,
             );
 
             return Ok(TradeDecision {

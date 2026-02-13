@@ -48,7 +48,7 @@ pub struct MarketState {
     pub strike_type: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Orderbook {
     pub yes: Vec<(u32, u32)>,
     pub no: Vec<(u32, u32)>,

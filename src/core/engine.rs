@@ -4,6 +4,7 @@ use crate::ports::exchange::Exchange;
 use crate::ports::weather_feed::WeatherFeed;
 use crate::storage;
 use anyhow::Result;
+use chrono::Timelike;
 
 pub async fn run_cycle(
     exchange: &dyn Exchange,
@@ -77,7 +78,7 @@ pub async fn run_cycle(
     }
 
     // Filter by min_minutes_to_expiry
-    let brackets: Vec<MarketState> = brackets
+    let mut brackets: Vec<MarketState> = brackets
         .into_iter()
         .filter(|m| m.minutes_to_expiry >= config.min_minutes_to_expiry)
         .collect();
@@ -85,6 +86,22 @@ pub async fn run_cycle(
     if brackets.is_empty() {
         tracing::info!("All brackets too close to expiry");
         return Ok(());
+    }
+
+    // Skip events where the daily high is likely already known
+    if should_skip_settled_event(&brackets[0].event_ticker, &config.weather_timezone) {
+        let settled_event = brackets[0].event_ticker.clone();
+        tracing::info!("Event {} likely settled (past 5 PM local) — looking for next event", settled_event);
+        let all_markets = exchange.active_markets().await?;
+        let next: Vec<MarketState> = all_markets
+            .into_iter()
+            .filter(|m| m.event_ticker != settled_event && m.minutes_to_expiry >= config.min_minutes_to_expiry)
+            .collect();
+        if next.is_empty() {
+            tracing::info!("No next event available after skipping settled event");
+            return Ok(());
+        }
+        brackets = next;
     }
 
     let event_ticker = brackets[0].event_ticker.clone();
@@ -124,7 +141,7 @@ pub async fn run_cycle(
             stats: stats::compute(&ledger),
             last_n_trades: ledger.iter().rev().take(20).cloned().collect(),
             market: market.clone(),
-            orderbook,
+            orderbook: orderbook.clone(),
             weather: weather.clone(),
         };
 
@@ -173,9 +190,30 @@ pub async fn run_cycle(
         ));
 
         if decision.action == Action::Buy {
-            // Reclaim the orderbook for the candidate
-            let ob = exchange.orderbook(&market.ticker).await?;
-            buy_candidates.push((market.clone(), ob, decision));
+            buy_candidates.push((market.clone(), orderbook, decision));
+        }
+    }
+
+    // Bracket coverage sanity check
+    if let Some(w) = &weather {
+        if !w.ensemble_member_highs.is_empty() {
+            let total = w.ensemble_member_highs.len();
+            let mut covered = 0usize;
+            for market in &brackets {
+                if let Some(mt) = MarketType::from_market(market) {
+                    covered += match &mt {
+                        MarketType::Above(t) => w.ensemble_member_highs.iter().filter(|h| **h > *t).count(),
+                        MarketType::Below(t) => w.ensemble_member_highs.iter().filter(|h| **h < *t).count(),
+                        MarketType::Between(lo, hi) => w.ensemble_member_highs.iter().filter(|h| **h >= *lo && **h < *hi).count(),
+                    };
+                }
+            }
+            let pct = covered as f64 / total as f64 * 100.0;
+            if pct < 90.0 {
+                tracing::warn!("Bracket coverage: {:.0}% ({}/{} members) — gaps in bracket ranges", pct, covered, total);
+            } else {
+                tracing::info!("Bracket coverage: {:.0}% ({}/{})", pct, covered, total);
+            }
         }
     }
 
@@ -201,10 +239,12 @@ pub async fn run_cycle(
     let price = best_decision.max_price_cents.unwrap_or(50).clamp(1, 99);
 
     tracing::info!(
-        "Best bracket: {} | edge={:.1}pp | {:?} {}x @ {}¢ | {}",
+        "Best bracket: {} | edge={:.1}pp | {:?} {}x @ {}¢ (brain: {}x @ {}¢, max={})",
         best_market.ticker, best_decision.edge_magnitude * 100.0,
-        side, shares, price, best_decision.reasoning
+        side, shares, price,
+        best_decision.shares.unwrap_or(1), best_decision.max_price_cents.unwrap_or(50), config.max_shares
     );
+    tracing::info!("Reasoning: {}", best_decision.reasoning);
 
     // 10. FINAL POSITION CHECK (race condition guard)
     let fresh_positions = exchange.positions().await?;
@@ -282,4 +322,32 @@ pub async fn run_cycle(
     }
 
     Ok(())
+}
+
+fn should_skip_settled_event(event_ticker: &str, timezone: &str) -> bool {
+    let parts: Vec<&str> = event_ticker.split('-').collect();
+    if parts.len() < 2 || parts[1].len() < 6 {
+        return false;
+    }
+    let date_part = parts[1];
+    let year_suffix: u32 = match date_part[..2].parse() { Ok(y) => y, Err(_) => return false };
+    let month_str = &date_part[2..5];
+    let day: u32 = match date_part[5..].parse() { Ok(d) => d, Err(_) => return false };
+    let month: u32 = match month_str {
+        "JAN" => 1, "FEB" => 2, "MAR" => 3, "APR" => 4, "MAY" => 5, "JUN" => 6,
+        "JUL" => 7, "AUG" => 8, "SEP" => 9, "OCT" => 10, "NOV" => 11, "DEC" => 12,
+        _ => return false,
+    };
+    let event_date = format!("20{:02}-{:02}-{:02}", year_suffix, month, day);
+    let offset_hours: i32 = match timezone {
+        "America/New_York" | "US/Eastern" => -5,
+        "America/Chicago" | "US/Central" => -6,
+        "America/Denver" | "US/Mountain" => -7,
+        "America/Los_Angeles" | "US/Pacific" => -8,
+        _ => 0,
+    };
+    let offset = chrono::FixedOffset::east_opt(offset_hours * 3600).unwrap();
+    let local_now = chrono::Utc::now().with_timezone(&offset);
+    let today = local_now.format("%Y-%m-%d").to_string();
+    event_date == today && local_now.hour() >= 17
 }
