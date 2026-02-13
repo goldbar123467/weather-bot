@@ -31,6 +31,9 @@ pub struct KalshiMarket {
     pub open_interest: Option<u64>,
     pub result: Option<String>,
     pub series_ticker: Option<String>,
+    pub floor_strike: Option<f64>,
+    pub cap_strike: Option<f64>,
+    pub strike_type: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

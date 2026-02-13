@@ -13,15 +13,6 @@ impl RulesBrain {
     }
 }
 
-/// What kind of temperature contract this is.
-#[derive(Debug)]
-enum MarketType {
-    /// "Will high be >X°?" — YES if above threshold
-    Above(f64),
-    /// "Will high be between X° and Y°?" — YES if in range
-    Between(f64, f64),
-}
-
 #[async_trait]
 impl Brain for RulesBrain {
     async fn decide(&self, ctx: &DecisionContext) -> Result<TradeDecision> {
@@ -30,19 +21,14 @@ impl Brain for RulesBrain {
             None => return Ok(pass("No weather data available")),
         };
 
-        let market_type = parse_market_type(&ctx.market.title, &ctx.market.ticker);
+        // Use API strike fields via MarketType::from_market()
+        let market_type = MarketType::from_market(&ctx.market);
         tracing::info!(
-            "Market: '{}' | ticker: {} | Parsed: {:?} | Ensemble buckets: {} | Confidence: {:?}",
+            "Market: '{}' | ticker: {} | MarketType: {:?} | floor={:?} cap={:?} strike_type='{}' | Confidence: {:?}",
             ctx.market.title, ctx.market.ticker, market_type,
-            weather.bucket_probabilities.len(), weather.confidence,
+            ctx.market.floor_strike, ctx.market.cap_strike, ctx.market.strike_type,
+            weather.confidence,
         );
-
-        if !weather.bucket_probabilities.is_empty() {
-            let summary: Vec<String> = weather.bucket_probabilities.iter()
-                .map(|b| format!("{}: {:.0}%", b.label, b.probability * 100.0))
-                .collect();
-            tracing::info!("Ensemble buckets: {}", summary.join(", "));
-        }
 
         let market_implied = match ctx.market.yes_ask {
             Some(ask) => ask as f64 / 100.0,
@@ -57,32 +43,46 @@ impl Brain for RulesBrain {
             yes_ask, no_ask, market_implied * 100.0
         );
 
-        // Compute ensemble YES probability based on market type
+        // Compute ensemble YES probability — prefer raw member highs, fall back to buckets
         let ensemble_yes = match &market_type {
-            Some(mt) if weather.ensemble.is_some() && !weather.bucket_probabilities.is_empty() => {
-                let prob = compute_ensemble_yes(&weather.bucket_probabilities, mt);
-                tracing::info!("Ensemble YES probability: {:.1}%", prob * 100.0);
-                Some(prob)
-            }
-            _ => {
-                // Fallback: use forecast point estimate vs threshold
-                match &market_type {
-                    Some(MarketType::Above(threshold)) => {
-                        let forecast_high = weather.open_meteo_forecast_high;
-                        let diff = forecast_high - threshold;
-                        // Rough sigmoid: if forecast is well above threshold, high prob
-                        let prob = 1.0 / (1.0 + (-diff / 2.0_f64).exp());
-                        tracing::info!(
-                            "No ensemble — using point estimate: forecast_high={:.1}°F vs threshold={:.0}°F → {:.0}% YES",
-                            forecast_high, threshold, prob * 100.0
-                        );
-                        Some(prob)
-                    }
-                    _ => {
-                        tracing::info!("Cannot compute ensemble probability — no market type or no data");
-                        None
+            Some(mt) => {
+                if !weather.ensemble_member_highs.is_empty() {
+                    // Exact computation from raw ensemble members
+                    let prob = compute_ensemble_yes_from_members(&weather.ensemble_member_highs, mt);
+                    let total = weather.ensemble_member_highs.len();
+                    let matching = (prob * total as f64).round() as usize;
+                    tracing::info!(
+                        "Ensemble YES (raw members): {}/{} members = {:.1}% | {:?}",
+                        matching, total, prob * 100.0, mt
+                    );
+                    Some(prob)
+                } else if weather.ensemble.is_some() && !weather.bucket_probabilities.is_empty() {
+                    // Fallback: bucket interpolation
+                    let prob = compute_ensemble_yes_from_buckets(&weather.bucket_probabilities, mt);
+                    tracing::info!("Ensemble YES (bucket fallback): {:.1}%", prob * 100.0);
+                    Some(prob)
+                } else {
+                    // Last resort: sigmoid from point estimate
+                    match mt {
+                        MarketType::Above(threshold) => {
+                            let diff = weather.open_meteo_forecast_high - threshold;
+                            let prob = 1.0 / (1.0 + (-diff / 2.0_f64).exp());
+                            tracing::info!(
+                                "No ensemble — sigmoid: forecast_high={:.1}°F vs threshold={:.0}°F → {:.0}% YES",
+                                weather.open_meteo_forecast_high, threshold, prob * 100.0
+                            );
+                            Some(prob)
+                        }
+                        _ => {
+                            tracing::info!("No ensemble data and non-Above market type — cannot estimate");
+                            None
+                        }
                     }
                 }
+            }
+            None => {
+                tracing::info!("Cannot determine market type from strike fields or ticker");
+                None
             }
         };
 
@@ -99,19 +99,24 @@ impl Brain for RulesBrain {
             let adj_edge_yes = edge_yes * confidence_multiplier;
             let adj_edge_no = edge_no * confidence_multiplier;
 
-            let (side, raw_edge, adj_edge, price) = if adj_edge_yes >= adj_edge_no {
+            let (side, _raw_edge, adj_edge, price) = if adj_edge_yes >= adj_edge_no {
                 (Side::Yes, edge_yes, adj_edge_yes, yes_ask)
             } else {
                 (Side::No, edge_no, adj_edge_no, no_ask)
             };
 
+            // Fee-aware: subtract estimated taker fee from edge
+            let fee_pp = estimate_fee_pp(1, price);
+            let net_edge = adj_edge - fee_pp;
+
             tracing::info!(
-                "Edge: YES={:+.1}pp NO={:+.1}pp (adj YES={:+.1}pp NO={:+.1}pp) → best={:?}",
+                "Edge: YES={:+.1}pp NO={:+.1}pp (adj YES={:+.1}pp NO={:+.1}pp) → best={:?} | Gross edge: {:.1}pp, fee: ~{:.1}pp, net edge: {:.1}pp",
                 edge_yes * 100.0, edge_no * 100.0,
-                adj_edge_yes * 100.0, adj_edge_no * 100.0, side
+                adj_edge_yes * 100.0, adj_edge_no * 100.0, side,
+                adj_edge * 100.0, fee_pp * 100.0, net_edge * 100.0
             );
 
-            if adj_edge < 0.05 {
+            if net_edge < 0.05 {
                 return Ok(pass(&format!(
                     "Edge too small: {:.1}pp adj on {:?}. Ensemble YES={:.0}% vs market={:.0}%. {:?} confidence.",
                     adj_edge * 100.0, side, ens_yes * 100.0, market_implied * 100.0, weather.confidence
@@ -125,7 +130,7 @@ impl Brain for RulesBrain {
                 )));
             }
 
-            let shares = size_from_edge(adj_edge);
+            let shares = size_from_edge(net_edge);
             let max_price = spread_aware_price(&ctx.market, &ctx.orderbook, &side);
 
             if max_price > 50 {
@@ -136,9 +141,9 @@ impl Brain for RulesBrain {
             }
 
             let reasoning = format!(
-                "Ensemble YES={:.0}% vs market implied={:.0}% → {:.1}pp edge on {:?} (adj {:.1}pp, {:?} confidence). {}x @ {}¢.",
+                "Ensemble YES={:.0}% vs market={:.0}% → {:.1}pp net edge on {:?} (gross {:.1}pp - fee ~{:.1}pp, {:?} confidence). {}x @ {}¢.",
                 ens_yes * 100.0, market_implied * 100.0,
-                raw_edge * 100.0, side, adj_edge * 100.0, weather.confidence,
+                net_edge * 100.0, side, adj_edge * 100.0, fee_pp * 100.0, weather.confidence,
                 shares, max_price,
             );
 
@@ -148,6 +153,7 @@ impl Brain for RulesBrain {
                 shares: Some(shares),
                 max_price_cents: Some(max_price),
                 reasoning,
+                edge_magnitude: net_edge.abs(),
             });
         }
 
@@ -165,79 +171,56 @@ fn pass(reason: &str) -> TradeDecision {
         shares: None,
         max_price_cents: None,
         reasoning: reason.to_string(),
+        edge_magnitude: 0.0,
     }
 }
 
-/// Parse market type from title and/or ticker.
-///
-/// Titles:  "Will the **high temp in NYC** be >39° on Feb 12, 2026?"
-/// Tickers: "KXHIGHNY-26FEB12-T39" — T39 means threshold 39°F
-fn parse_market_type(title: &str, ticker: &str) -> Option<MarketType> {
-    // Try ticker first: look for -T{num} pattern (most reliable)
-    if let Some(t_pos) = ticker.rfind("-T") {
-        let after_t = &ticker[t_pos + 2..];
-        if let Ok(threshold) = after_t.parse::<f64>() {
-            return Some(MarketType::Above(threshold));
-        }
+/// Compute ensemble YES probability from raw member highs — exact, no interpolation.
+fn compute_ensemble_yes_from_members(member_highs: &[f64], market_type: &MarketType) -> f64 {
+    let total = member_highs.len() as f64;
+    if total == 0.0 {
+        return 0.0;
     }
-
-    // Try title: look for ">X°" or "above X°" or "at least X°"
-    let clean = title.replace("°F", "°").replace("**", "");
-    if let Some(pos) = clean.find('>') {
-        let after = &clean[pos + 1..];
-        let num_str: String = after.chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-            .collect();
-        if let Ok(threshold) = num_str.parse::<f64>() {
-            return Some(MarketType::Above(threshold));
-        }
-    }
-
-    // Try title: look for "between X and Y" or "X to Y"
-    let lower = clean.replace("°", "");
-    if lower.contains("between") {
-        let nums: Vec<f64> = lower
-            .split(|c: char| !c.is_ascii_digit() && c != '.' && c != '-')
-            .filter_map(|s| s.parse().ok())
-            .filter(|&n| n > -50.0 && n < 150.0)
-            .collect();
-        if nums.len() >= 2 {
-            let a = nums[nums.len() - 2];
-            let b = nums[nums.len() - 1];
-            if (b - a).abs() <= 20.0 {
-                return Some(MarketType::Between(a.min(b), a.max(b)));
-            }
-        }
-    }
-
-    None
+    let count = match market_type {
+        MarketType::Above(t) => member_highs.iter().filter(|h| **h > *t).count(),
+        MarketType::Below(t) => member_highs.iter().filter(|h| **h < *t).count(),
+        MarketType::Between(lo, hi) => member_highs.iter().filter(|h| **h >= *lo && **h < *hi).count(),
+    };
+    count as f64 / total
 }
 
-/// Compute ensemble YES probability given the market type.
-fn compute_ensemble_yes(buckets: &[TempBucketProbability], market_type: &MarketType) -> f64 {
+/// Fallback: compute ensemble YES probability from 2°F temperature buckets.
+fn compute_ensemble_yes_from_buckets(buckets: &[TempBucketProbability], market_type: &MarketType) -> f64 {
     match market_type {
         MarketType::Above(threshold) => {
-            // Sum probability of all buckets whose lower bound >= threshold
-            // Plus partial credit for the bucket that straddles the threshold
             let mut prob = 0.0;
             for b in buckets {
                 if b.lower >= *threshold {
-                    // Entire bucket is above threshold
                     prob += b.probability;
                 } else if b.upper > *threshold {
-                    // Bucket straddles threshold — interpolate
                     let fraction = (b.upper - threshold) / (b.upper - b.lower);
                     prob += b.probability * fraction;
                 }
             }
             prob
         }
+        MarketType::Below(threshold) => {
+            let mut prob = 0.0;
+            for b in buckets {
+                if b.upper <= *threshold {
+                    prob += b.probability;
+                } else if b.lower < *threshold {
+                    let fraction = (threshold - b.lower) / (b.upper - b.lower);
+                    prob += b.probability * fraction;
+                }
+            }
+            prob
+        }
         MarketType::Between(low, high) => {
-            // Sum probability of buckets that overlap [low, high]
             let mut prob = 0.0;
             for b in buckets {
                 if b.lower >= *high || b.upper <= *low {
-                    continue; // no overlap
+                    continue;
                 }
                 let overlap_low = b.lower.max(*low);
                 let overlap_high = b.upper.min(*high);
@@ -247,6 +230,18 @@ fn compute_ensemble_yes(buckets: &[TempBucketProbability], market_type: &MarketT
             prob
         }
     }
+}
+
+/// Estimate Kalshi taker fee as a fraction (percentage points).
+/// Kalshi charges: fee_per_contract = min(price, 100-price) * fee_rate
+/// where fee_rate is ~7% for taker (crossing the spread).
+/// Returns fee as a fraction of notional (i.e., divide by 100 to get per-cent).
+fn estimate_fee_pp(shares: u32, price_cents: u32) -> f64 {
+    let fee_rate = 0.07; // 7% taker fee
+    let capped_price = price_cents.min(100 - price_cents) as f64;
+    let fee_per_contract = capped_price * fee_rate;
+    // Convert to percentage points: fee in cents / 100 cents per dollar
+    fee_per_contract * shares as f64 / (shares as f64 * 100.0)
 }
 
 fn size_from_edge(edge: f64) -> u32 {

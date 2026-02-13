@@ -44,9 +44,6 @@ pub fn validate_startup(config: &Config) -> anyhow::Result<()> {
         anyhow::bail!("KALSHI_SERIES_TICKER not set — run discovery first");
     }
 
-    if config.openrouter_api_key.is_empty() {
-        anyhow::bail!("OPENROUTER_API_KEY not set");
-    }
     if config.kalshi_key_id.is_empty() {
         anyhow::bail!("KALSHI_API_KEY_ID not set");
     }

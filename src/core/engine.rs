@@ -69,23 +69,40 @@ pub async fn run_cycle(
         return Ok(());
     }
 
-    // 4. MARKET — fetch by hardcoded series ticker
-    let market = match exchange.active_market().await? {
-        Some(m) if m.minutes_to_expiry >= config.min_minutes_to_expiry => m,
-        Some(m) => {
-            tracing::info!("Too close to expiry: {:.1}min", m.minutes_to_expiry);
-            return Ok(());
-        }
-        None => {
-            tracing::info!("No active market");
-            return Ok(());
-        }
-    };
+    // 4. MARKETS — fetch all brackets for nearest event
+    let brackets = exchange.active_markets().await?;
+    if brackets.is_empty() {
+        tracing::info!("No active markets");
+        return Ok(());
+    }
 
-    // 5. ORDERBOOK
-    let orderbook = exchange.orderbook(&market.ticker).await?;
+    // Filter by min_minutes_to_expiry
+    let brackets: Vec<MarketState> = brackets
+        .into_iter()
+        .filter(|m| m.minutes_to_expiry >= config.min_minutes_to_expiry)
+        .collect();
 
-    // 5.5. WEATHER — external forecast (best-effort, non-blocking)
+    if brackets.is_empty() {
+        tracing::info!("All brackets too close to expiry");
+        return Ok(());
+    }
+
+    let event_ticker = brackets[0].event_ticker.clone();
+    tracing::info!(
+        "Found {} brackets for event {} (expiry in {:.1}min)",
+        brackets.len(), event_ticker, brackets[0].minutes_to_expiry
+    );
+
+    // 5. EVENT-LEVEL POSITION CHECK — skip if ANY position on this event
+    let positions = exchange.positions().await?;
+    if positions.iter().any(|p| {
+        brackets.iter().any(|b| b.ticker == p.ticker)
+    }) {
+        tracing::warn!("Existing position on event {} — skipping entire event", event_ticker);
+        return Ok(());
+    }
+
+    // 6. WEATHER — fetch once, shared across all brackets
     let weather = match weather_feed.forecast().await {
         Ok(w) => w,
         Err(e) => {
@@ -94,36 +111,111 @@ pub async fn run_cycle(
         }
     };
 
-    // 6. BRAIN — one AI call
-    let context = DecisionContext {
-        prompt_md: storage::read_prompt()?,
-        stats: computed_stats,
-        last_n_trades: ledger.iter().rev().take(20).cloned().collect(),
-        market: market.clone(),
-        orderbook,
-        weather,
-    };
+    // 7. EVALUATE all brackets
+    let prompt_md = storage::read_prompt()?;
+    let mut buy_candidates: Vec<(MarketState, Orderbook, TradeDecision)> = Vec::new();
+    let mut scan_lines: Vec<String> = Vec::new();
 
-    let decision = brain.decide(&context).await?;
+    for market in &brackets {
+        let orderbook = exchange.orderbook(&market.ticker).await?;
 
-    // 7. VALIDATE
-    if decision.action == Action::Pass {
-        tracing::info!("PASS: {}", decision.reasoning);
+        let context = DecisionContext {
+            prompt_md: prompt_md.clone(),
+            stats: stats::compute(&ledger),
+            last_n_trades: ledger.iter().rev().take(20).cloned().collect(),
+            market: market.clone(),
+            orderbook,
+            weather: weather.clone(),
+        };
+
+        let decision = brain.decide(&context).await?;
+
+        // Build scan line for logging
+        let market_type = MarketType::from_market(market);
+        let mt_label = match &market_type {
+            Some(MarketType::Above(t)) => format!(">{:.0}°", t),
+            Some(MarketType::Below(t)) => format!("<{:.0}°", t),
+            Some(MarketType::Between(lo, hi)) => format!("{:.0}-{:.0}°", lo, hi),
+            None => "???".into(),
+        };
+
+        let ens_pct = if let (Some(w), Some(mt)) = (&weather, &market_type) {
+            if !w.ensemble_member_highs.is_empty() {
+                let total = w.ensemble_member_highs.len() as f64;
+                let count = match mt {
+                    MarketType::Above(t) => w.ensemble_member_highs.iter().filter(|h| **h > *t).count(),
+                    MarketType::Below(t) => w.ensemble_member_highs.iter().filter(|h| **h < *t).count(),
+                    MarketType::Between(lo, hi) => w.ensemble_member_highs.iter().filter(|h| **h >= *lo && **h < *hi).count(),
+                };
+                format!("{:.0}%", count as f64 / total * 100.0)
+            } else {
+                "n/a".into()
+            }
+        } else {
+            "n/a".into()
+        };
+
+        let mkt_pct = market.yes_ask.map(|a| format!("{:.0}%", a)).unwrap_or_else(|| "n/a".into());
+        let edge_pp = decision.edge_magnitude * 100.0;
+
+        let action_label = match decision.action {
+            Action::Buy => {
+                let side = decision.side.as_ref().map(|s| format!("{:?}", s).to_uppercase()).unwrap_or_default();
+                format!("BUY {}", side)
+            }
+            Action::Pass => "PASS".into(),
+        };
+
+        scan_lines.push(format!(
+            "  {:<12} ({:<8}): ens={:<5} mkt={:<5} edge={:+.1}pp → {}",
+            market.ticker.split('-').last().unwrap_or(&market.ticker),
+            mt_label, ens_pct, mkt_pct, edge_pp, action_label
+        ));
+
+        if decision.action == Action::Buy {
+            // Reclaim the orderbook for the candidate
+            let ob = exchange.orderbook(&market.ticker).await?;
+            buy_candidates.push((market.clone(), ob, decision));
+        }
+    }
+
+    // 8. LOG bracket scan table
+    tracing::info!("Bracket scan for {}:", event_ticker);
+    for line in &scan_lines {
+        tracing::info!("{}", line);
+    }
+
+    // 9. SELECT best bracket by edge_magnitude
+    if buy_candidates.is_empty() {
+        tracing::info!("PASS: No bracket has sufficient edge");
         return Ok(());
     }
 
-    let side = decision.side.unwrap_or(Side::Yes);
-    let shares = decision.shares.unwrap_or(1).min(config.max_shares);
-    let price = decision.max_price_cents.unwrap_or(50).clamp(1, 99);
+    buy_candidates.sort_by(|a, b| {
+        b.2.edge_magnitude.partial_cmp(&a.2.edge_magnitude).unwrap()
+    });
 
-    // 8. FINAL POSITION CHECK — only block if position is on THIS market
+    let (best_market, _best_ob, best_decision) = &buy_candidates[0];
+    let side = best_decision.side.clone().unwrap_or(Side::Yes);
+    let shares = best_decision.shares.unwrap_or(1).min(config.max_shares);
+    let price = best_decision.max_price_cents.unwrap_or(50).clamp(1, 99);
+
+    tracing::info!(
+        "Best bracket: {} | edge={:.1}pp | {:?} {}x @ {}¢ | {}",
+        best_market.ticker, best_decision.edge_magnitude * 100.0,
+        side, shares, price, best_decision.reasoning
+    );
+
+    // 10. FINAL POSITION CHECK (race condition guard)
     let fresh_positions = exchange.positions().await?;
-    if fresh_positions.iter().any(|p| p.ticker == market.ticker) {
-        tracing::warn!("Position on {} — aborting order", market.ticker);
+    if fresh_positions.iter().any(|p| {
+        brackets.iter().any(|b| b.ticker == p.ticker)
+    }) {
+        tracing::warn!("Position appeared on event {} during evaluation — aborting", event_ticker);
         return Ok(());
     }
 
-    // 9. EXECUTE — order FIRST, ledger SECOND
+    // 11. EXECUTE — order FIRST, ledger SECOND
     let current_stats = stats::compute(&ledger);
 
     if config.paper_trade {
@@ -133,12 +225,12 @@ pub async fn run_cycle(
             side,
             shares,
             price,
-            market.ticker,
+            best_market.ticker,
             paper_id
         );
         storage::append_ledger(&LedgerRow {
             timestamp: chrono::Utc::now().to_rfc3339(),
-            ticker: market.ticker.clone(),
+            ticker: best_market.ticker.clone(),
             side: format!("{:?}", side).to_lowercase(),
             shares,
             price,
@@ -150,7 +242,7 @@ pub async fn run_cycle(
     } else {
         let order_result = exchange
             .place_order(&OrderRequest {
-                ticker: market.ticker.clone(),
+                ticker: best_market.ticker.clone(),
                 side: side.clone(),
                 shares,
                 price_cents: price,
@@ -161,11 +253,11 @@ pub async fn run_cycle(
             Ok(result) => {
                 tracing::info!(
                     "LIVE: {:?} {}x @ {}¢ | {} (order {} status: {})",
-                    side, shares, price, market.ticker, result.order_id, result.status
+                    side, shares, price, best_market.ticker, result.order_id, result.status
                 );
                 if let Err(e) = storage::append_ledger(&LedgerRow {
                     timestamp: chrono::Utc::now().to_rfc3339(),
-                    ticker: market.ticker.clone(),
+                    ticker: best_market.ticker.clone(),
                     side: format!("{:?}", side).to_lowercase(),
                     shares,
                     price,
@@ -189,6 +281,5 @@ pub async fn run_cycle(
         }
     }
 
-    // 10. EXIT
     Ok(())
 }

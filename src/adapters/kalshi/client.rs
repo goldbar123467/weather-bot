@@ -98,6 +98,11 @@ impl KalshiClient {
 #[async_trait]
 impl Exchange for KalshiClient {
     async fn active_market(&self) -> Result<Option<MarketState>> {
+        let markets = self.active_markets().await?;
+        Ok(markets.into_iter().next())
+    }
+
+    async fn active_markets(&self) -> Result<Vec<MarketState>> {
         let path = format!(
             "/trade-api/v2/markets?series_ticker={}&status=open",
             self.series_ticker
@@ -116,28 +121,53 @@ impl Exchange for KalshiClient {
                         .ok()?
                         .with_timezone(&chrono::Utc);
                 let mins = (exp - now).num_seconds() as f64 / 60.0;
+                if mins <= 0.0 {
+                    return None;
+                }
                 Some((m, mins))
             })
-            .filter(|(_, mins)| *mins > 0.0)
             .collect();
 
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Sort by expiry time to find the nearest event
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-        Ok(candidates.into_iter().next().map(|(m, mins)| MarketState {
-            ticker: m.ticker,
-            event_ticker: m.event_ticker,
-            title: m.title,
-            yes_bid: m.yes_bid,
-            yes_ask: m.yes_ask,
-            no_bid: m.no_bid,
-            no_ask: m.no_ask,
-            last_price: m.last_price,
-            volume: m.volume.unwrap_or(0),
-            volume_24h: m.volume_24h.unwrap_or(0),
-            open_interest: m.open_interest.unwrap_or(0),
-            expiration_time: m.expected_expiration_time.or(m.expiration_time).unwrap_or_default(),
-            minutes_to_expiry: mins,
-        }))
+        // Group by event_ticker: pick the nearest-expiry event and return all its brackets
+        let nearest_event = candidates[0].0.event_ticker.clone();
+        let mut brackets: Vec<MarketState> = candidates
+            .into_iter()
+            .filter(|(m, _)| m.event_ticker == nearest_event)
+            .map(|(m, mins)| MarketState {
+                ticker: m.ticker,
+                event_ticker: m.event_ticker,
+                title: m.title,
+                yes_bid: m.yes_bid,
+                yes_ask: m.yes_ask,
+                no_bid: m.no_bid,
+                no_ask: m.no_ask,
+                last_price: m.last_price,
+                volume: m.volume.unwrap_or(0),
+                volume_24h: m.volume_24h.unwrap_or(0),
+                open_interest: m.open_interest.unwrap_or(0),
+                expiration_time: m.expected_expiration_time.or(m.expiration_time).unwrap_or_default(),
+                minutes_to_expiry: mins,
+                floor_strike: m.floor_strike,
+                cap_strike: m.cap_strike,
+                strike_type: m.strike_type.clone().unwrap_or_default(),
+            })
+            .collect();
+
+        // Sort brackets by floor_strike for consistent ordering
+        brackets.sort_by(|a, b| {
+            let a_strike = a.floor_strike.unwrap_or(f64::NEG_INFINITY);
+            let b_strike = b.floor_strike.unwrap_or(f64::NEG_INFINITY);
+            a_strike.partial_cmp(&b_strike).unwrap()
+        });
+
+        Ok(brackets)
     }
 
     async fn orderbook(&self, ticker: &str) -> Result<Orderbook> {

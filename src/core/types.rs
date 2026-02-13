@@ -9,6 +9,7 @@ pub struct TradeDecision {
     pub shares: Option<u32>,
     pub max_price_cents: Option<u32>,
     pub reasoning: String,
+    pub edge_magnitude: f64,
 }
 
 #[derive(Debug, Deserialize, PartialEq)]
@@ -42,6 +43,9 @@ pub struct MarketState {
     pub open_interest: u64,
     pub expiration_time: String,
     pub minutes_to_expiry: f64,
+    pub floor_strike: Option<f64>,
+    pub cap_strike: Option<f64>,
+    pub strike_type: String,
 }
 
 #[derive(Debug)]
@@ -97,7 +101,41 @@ pub struct WeatherSnapshot {
     pub hourly_forecasts: Vec<HourlyForecast>,
     pub ensemble: Option<EnsembleForecast>,
     pub bucket_probabilities: Vec<TempBucketProbability>,
+    pub ensemble_member_highs: Vec<f64>,
     pub confidence: ForecastConfidence,
+}
+
+// ── Market Type (derived from strike fields) ──
+
+#[derive(Debug, Clone)]
+pub enum MarketType {
+    Above(f64),
+    Below(f64),
+    Between(f64, f64),
+}
+
+impl MarketType {
+    pub fn from_market(m: &MarketState) -> Option<MarketType> {
+        match m.strike_type.as_str() {
+            "greater" | ">" => m.floor_strike.map(MarketType::Above),
+            "less" | "<" => m.cap_strike.map(MarketType::Below),
+            "between" | "between_inclusive" => {
+                match (m.floor_strike, m.cap_strike) {
+                    (Some(lo), Some(hi)) => Some(MarketType::Between(lo, hi)),
+                    _ => None,
+                }
+            }
+            _ => {
+                // Fallback: infer from which strikes are present
+                match (m.floor_strike, m.cap_strike) {
+                    (Some(lo), Some(hi)) => Some(MarketType::Between(lo, hi)),
+                    (Some(t), None) => Some(MarketType::Above(t)),
+                    (None, Some(t)) => Some(MarketType::Below(t)),
+                    (None, None) => None,
+                }
+            }
+        }
+    }
 }
 
 // ── Orders & Positions ──
@@ -211,7 +249,7 @@ impl Config {
         let pem = std::fs::read_to_string(&pem_path).unwrap_or_default();
 
         Ok(Self {
-            max_shares: 5,
+            max_shares: 2,
             max_daily_loss_cents: 1000,
             max_consecutive_losses: 7,
             min_balance_cents: 500,

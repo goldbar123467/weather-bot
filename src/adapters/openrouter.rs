@@ -178,6 +178,7 @@ fn parse_decision(raw: &str) -> Result<TradeDecision> {
             shares: None,
             max_price_cents: None,
             reasoning: "Failed to parse AI response".into(),
+            edge_magnitude: 0.0,
         });
     };
 

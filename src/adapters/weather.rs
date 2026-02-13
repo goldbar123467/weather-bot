@@ -11,6 +11,30 @@ pub struct WeatherClient {
     timezone: String,
 }
 
+/// Compute "today" in the configured timezone using a UTC offset.
+/// Open-Meteo returns data in the requested timezone, so we need "today"
+/// relative to that timezone, not the server's local time.
+fn today_in_timezone(tz: &str) -> String {
+    let offset_hours: i32 = match tz {
+        "America/New_York" | "US/Eastern" => -5,
+        "America/Chicago" | "US/Central" => -6,
+        "America/Denver" | "US/Mountain" => -7,
+        "America/Los_Angeles" | "US/Pacific" => -8,
+        "America/Anchorage" | "US/Alaska" => -9,
+        "Pacific/Honolulu" | "US/Hawaii" => -10,
+        "Europe/London" => 0,
+        "Europe/Berlin" | "Europe/Paris" => 1,
+        _ => {
+            // Default: use UTC and log a warning
+            tracing::warn!("Unknown timezone '{}', defaulting to UTC for date computation", tz);
+            0
+        }
+    };
+    let utc_now = chrono::Utc::now();
+    let offset = chrono::FixedOffset::east_opt(offset_hours * 3600).unwrap();
+    utc_now.with_timezone(&offset).format("%Y-%m-%d").to_string()
+}
+
 impl WeatherClient {
     pub fn new(config: &Config) -> Result<Self> {
         Ok(Self {
@@ -102,7 +126,7 @@ impl WeatherClient {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Missing hourly temps"))?;
 
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = today_in_timezone(&self.timezone);
 
         let mut hourly = Vec::new();
         let mut daily_high: f64 = f64::NEG_INFINITY;
@@ -133,9 +157,9 @@ impl WeatherClient {
         })
     }
 
-    async fn fetch_open_meteo_ensemble(&self) -> Option<(EnsembleForecast, Vec<TempBucketProbability>)> {
+    async fn fetch_open_meteo_ensemble(&self) -> Option<(EnsembleForecast, Vec<TempBucketProbability>, Vec<f64>)> {
         let url = format!(
-            "https://ensemble-api.open-meteo.com/v1/ensemble?latitude={}&longitude={}&hourly=temperature_2m&models=icon_seamless,gfs_seamless,ecmwf_ifs025&temperature_unit=fahrenheit&timezone={}&forecast_days=2",
+            "https://ensemble-api.open-meteo.com/v1/ensemble?latitude={}&longitude={}&hourly=temperature_2m&models=icon_seamless,gfs_seamless,ecmwf_ifs025,ecmwf_aifs025,gem_global&temperature_unit=fahrenheit&timezone={}&forecast_days=2",
             self.lat, self.lon, self.timezone
         );
 
@@ -146,7 +170,7 @@ impl WeatherClient {
         }
 
         let data: serde_json::Value = resp.json().await.ok()?;
-        let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+        let today = today_in_timezone(&self.timezone);
 
         let mut all_highs: Vec<f64> = Vec::new();
 
@@ -233,7 +257,7 @@ impl WeatherClient {
             temp += 2;
         }
 
-        Some((ensemble, buckets))
+        Some((ensemble, buckets, all_highs))
     }
 }
 
@@ -268,11 +292,11 @@ impl WeatherFeed for WeatherClient {
             }
         };
 
-        let (ensemble, bucket_probabilities) = match ensemble_result {
-            Some((e, b)) => (Some(e), b),
+        let (ensemble, bucket_probabilities, ensemble_member_highs) = match ensemble_result {
+            Some((e, b, highs)) => (Some(e), b, highs),
             None => {
                 tracing::warn!("Open-Meteo ensemble unavailable, continuing without it");
-                (None, Vec::new())
+                (None, Vec::new(), Vec::new())
             }
         };
 
@@ -293,6 +317,7 @@ impl WeatherFeed for WeatherClient {
             hourly_forecasts: det.hourly,
             ensemble,
             bucket_probabilities,
+            ensemble_member_highs,
             confidence,
         }))
     }
