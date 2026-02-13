@@ -4,9 +4,9 @@ mod ports;
 mod safety;
 mod storage;
 
-use adapters::binance::BinanceClient;
+use adapters::weather::WeatherClient;
 use adapters::kalshi::client::KalshiClient;
-use adapters::openrouter::OpenRouterClient;
+use core::rules_brain::RulesBrain;
 use core::types::Config;
 
 #[tokio::main]
@@ -24,8 +24,8 @@ async fn main() -> anyhow::Result<()> {
     let _lock = safety::Lockfile::acquire(&config.lockfile_path)?;
 
     let exchange = KalshiClient::new(&config)?;
-    let brain = OpenRouterClient::new(&config)?;
-    let price_feed = BinanceClient::new(&config)?;
+    let brain = RulesBrain::new();
+    let weather_feed = WeatherClient::new(&config)?;
 
-    core::engine::run_cycle(&exchange, &brain, &price_feed, &config).await
+    core::engine::run_cycle(&exchange, &brain, &weather_feed, &config).await
 }

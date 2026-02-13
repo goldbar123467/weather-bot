@@ -1,3 +1,4 @@
+use crate::core::indicators;
 use crate::core::types::*;
 use crate::ports::brain::Brain;
 use anyhow::Result;
@@ -20,16 +21,16 @@ impl OpenRouterClient {
 #[async_trait]
 impl Brain for OpenRouterClient {
     async fn decide(&self, ctx: &DecisionContext) -> Result<TradeDecision> {
-        let btc_section = match &ctx.btc_price {
-            Some(snap) => format!(
-                "\n\n---\n## BTC PRICE (Binance BTCUSDT)\n{}",
-                format_btc_price(snap)
+        let weather_section = match &ctx.weather {
+            Some(w) => format!(
+                "\n\n---\n## WEATHER FORECAST ({})\n{}",
+                w.city, format_weather(w)
             ),
-            None => "\n\n---\n## BTC PRICE\nUnavailable this cycle.".into(),
+            None => "\n\n---\n## WEATHER FORECAST\nUnavailable this cycle.".into(),
         };
 
         let prompt = format!(
-            "{prompt}\n\n---\n## STATS\n{stats}\n\n---\n## LAST {n} TRADES\n{ledger}\n\n---\n## MARKET\n{market}\n\n---\n## ORDERBOOK\nYes bids: {yes_ob}\nNo bids: {no_ob}{btc}",
+            "{prompt}\n\n---\n## STATS\n{stats}\n\n---\n## LAST {n} TRADES\n{ledger}\n\n---\n## MARKET\n{market}\n\n---\n## ORDERBOOK\nYes bids: {yes_ob}\nNo bids: {no_ob}{weather}",
             prompt = ctx.prompt_md,
             stats = format_stats(&ctx.stats),
             n = ctx.last_n_trades.len(),
@@ -37,11 +38,11 @@ impl Brain for OpenRouterClient {
             market = format_market(&ctx.market),
             yes_ob = format_ob_side(&ctx.orderbook.yes),
             no_ob = format_ob_side(&ctx.orderbook.no),
-            btc = btc_section,
+            weather = weather_section,
         );
 
         let body = serde_json::json!({
-            "model": "anthropic/claude-opus-4-6",
+            "model": "moonshotai/kimi-k2.5",
             "max_tokens": 1200,
             "temperature": 0.2,
             "messages": [{"role": "user", "content": prompt}]
@@ -52,7 +53,7 @@ impl Brain for OpenRouterClient {
             .post("https://openrouter.ai/api/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("HTTP-Referer", "https://kyzlolabs.com")
-            .header("X-Title", "Kalshi BTC Bot")
+            .header("X-Title", "Kalshi Weather Bot")
             .json(&body)
             .send()
             .await?
@@ -112,39 +113,47 @@ fn format_ob_side(levels: &[(u32, u32)]) -> String {
         .join(", ")
 }
 
-fn format_btc_price(snap: &PriceSnapshot) -> String {
-    let ind = &snap.indicators;
-    let momentum_str = match ind.momentum {
-        MomentumDirection::Up => "UP",
-        MomentumDirection::Down => "DOWN",
-        MomentumDirection::Flat => "FLAT",
+fn format_weather(w: &WeatherSnapshot) -> String {
+    let confidence_str = match w.confidence {
+        ForecastConfidence::High => "HIGH (<2°F std dev)",
+        ForecastConfidence::Medium => "MEDIUM (2-4°F std dev)",
+        ForecastConfidence::Low => "LOW (>4°F std dev)",
     };
 
-    let mut s = format!(
-        "Spot: ${:.2} | 15m change: {:+.3}% | 1h change: {:+.3}% | Momentum: {}\n\
-         SMA(15x1m): ${:.2} | Price vs SMA: {} | 1m volatility: {:.4}%",
-        ind.spot_price,
-        ind.pct_change_15m,
-        ind.pct_change_1h,
-        momentum_str,
-        ind.sma_15m,
-        ind.price_vs_sma,
-        ind.volatility_1m,
-    );
+    let mut s = format!("Current temp: {:.1}°F\n", w.current_temp_f);
+    s.push_str(&format!("Forecast confidence: {}\n", confidence_str));
+    s.push_str(&format!("Source agreement: {}\n", indicators::forecast_agreement(w)));
 
-    if !ind.last_3_candles.is_empty() {
-        s.push_str("\nLast 3 candles (1m): ");
-        let candle_strs: Vec<String> = ind
-            .last_3_candles
-            .iter()
-            .map(|c| {
-                format!(
-                    "O:{:.0} H:{:.0} L:{:.0} C:{:.0} V:{:.1}",
-                    c.open, c.high, c.low, c.close, c.volume
-                )
-            })
-            .collect();
-        s.push_str(&candle_strs.join(" | "));
+    if let Some(nws_high) = w.nws_forecast_high {
+        s.push_str(&format!("NWS forecast high: {:.0}°F", nws_high));
+        if let Some(ref short) = w.nws_short_forecast {
+            s.push_str(&format!(" ({})", short));
+        }
+        s.push('\n');
+    }
+    if let Some(nws_low) = w.nws_forecast_low {
+        s.push_str(&format!("NWS forecast low: {:.0}°F\n", nws_low));
+    }
+
+    s.push_str(&format!("Open-Meteo forecast high: {:.1}°F\n", w.open_meteo_forecast_high));
+
+    if let Some(ref ens) = w.ensemble {
+        s.push_str(&format!("Ensemble: {}\n", indicators::ensemble_summary(ens)));
+    }
+
+    if !w.bucket_probabilities.is_empty() {
+        s.push_str("\nTemperature bucket probabilities (ensemble-derived):\n");
+        for b in &w.bucket_probabilities {
+            s.push_str(&format!("  {} → {:.0}%\n", b.label, b.probability * 100.0));
+        }
+    }
+
+    if !w.hourly_forecasts.is_empty() {
+        s.push_str("\nHourly trajectory (today):\n");
+        for h in w.hourly_forecasts.iter().step_by(3) {
+            let time_short = h.time.split('T').nth(1).unwrap_or(&h.time);
+            s.push_str(&format!("  {} → {:.1}°F\n", time_short, h.temperature_f));
+        }
     }
 
     s

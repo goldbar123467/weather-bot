@@ -50,44 +50,54 @@ pub struct Orderbook {
     pub no: Vec<(u32, u32)>,
 }
 
-// ── BTC Price Data ──
+// ── Weather Data ──
 
 #[derive(Debug, Clone)]
-pub struct Candle {
-    pub open_time: i64,
-    pub open: f64,
-    pub high: f64,
-    pub low: f64,
-    pub close: f64,
-    pub volume: f64,
-    pub close_time: i64,
+pub struct HourlyForecast {
+    pub time: String,
+    pub temperature_f: f64,
 }
 
 #[derive(Debug, Clone)]
-pub enum MomentumDirection {
-    Up,
-    Down,
-    Flat,
+pub struct EnsembleForecast {
+    pub model_count: usize,
+    pub mean_high: f64,
+    pub min_high: f64,
+    pub max_high: f64,
+    pub std_dev: f64,
+    pub p10: f64,
+    pub p25: f64,
+    pub p75: f64,
+    pub p90: f64,
 }
 
 #[derive(Debug, Clone)]
-pub struct PriceIndicators {
-    pub spot_price: f64,
-    pub pct_change_15m: f64,
-    pub pct_change_1h: f64,
-    pub momentum: MomentumDirection,
-    pub sma_15m: f64,
-    pub price_vs_sma: String,
-    pub volatility_1m: f64,
-    pub last_3_candles: Vec<Candle>,
+pub struct TempBucketProbability {
+    pub label: String,
+    pub lower: f64,
+    pub upper: f64,
+    pub probability: f64,
 }
 
 #[derive(Debug, Clone)]
-pub struct PriceSnapshot {
-    pub candles_1m: Vec<Candle>,
-    pub candles_5m: Vec<Candle>,
-    pub spot_price: f64,
-    pub indicators: PriceIndicators,
+pub enum ForecastConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+#[derive(Debug, Clone)]
+pub struct WeatherSnapshot {
+    pub city: String,
+    pub current_temp_f: f64,
+    pub nws_forecast_high: Option<f64>,
+    pub nws_forecast_low: Option<f64>,
+    pub nws_short_forecast: Option<String>,
+    pub open_meteo_forecast_high: f64,
+    pub hourly_forecasts: Vec<HourlyForecast>,
+    pub ensemble: Option<EnsembleForecast>,
+    pub bucket_probabilities: Vec<TempBucketProbability>,
+    pub confidence: ForecastConfidence,
 }
 
 // ── Orders & Positions ──
@@ -156,7 +166,7 @@ pub struct DecisionContext {
     pub last_n_trades: Vec<LedgerRow>,
     pub market: MarketState,
     pub orderbook: Orderbook,
-    pub btc_price: Option<PriceSnapshot>,
+    pub weather: Option<WeatherSnapshot>,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +198,10 @@ pub struct Config {
     pub kalshi_key_id: String,
     pub kalshi_private_key_pem: String,
     pub lockfile_path: String,
+    pub weather_city: String,
+    pub weather_lat: f64,
+    pub weather_lon: f64,
+    pub weather_timezone: String,
 }
 
 impl Config {
@@ -215,6 +229,18 @@ impl Config {
             kalshi_key_id: std::env::var("KALSHI_API_KEY_ID").unwrap_or_default(),
             kalshi_private_key_pem: pem,
             lockfile_path: "/tmp/kalshi-bot.lock".into(),
+            weather_city: std::env::var("WEATHER_CITY")
+                .unwrap_or_else(|_| "New York".into()),
+            weather_lat: std::env::var("WEATHER_LAT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(40.7128),
+            weather_lon: std::env::var("WEATHER_LON")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(-74.0060),
+            weather_timezone: std::env::var("WEATHER_TIMEZONE")
+                .unwrap_or_else(|_| "America/New_York".into()),
         })
     }
 }

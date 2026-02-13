@@ -1,14 +1,14 @@
-use crate::core::{indicators, risk, stats, types::*};
+use crate::core::{risk, stats, types::*};
 use crate::ports::brain::Brain;
 use crate::ports::exchange::Exchange;
-use crate::ports::price_feed::PriceFeed;
+use crate::ports::weather_feed::WeatherFeed;
 use crate::storage;
 use anyhow::Result;
 
 pub async fn run_cycle(
     exchange: &dyn Exchange,
     brain: &dyn Brain,
-    price_feed: &dyn PriceFeed,
+    weather_feed: &dyn WeatherFeed,
     config: &Config,
 ) -> Result<()> {
     // 1. CANCEL stale resting orders from previous cycles
@@ -85,8 +85,14 @@ pub async fn run_cycle(
     // 5. ORDERBOOK
     let orderbook = exchange.orderbook(&market.ticker).await?;
 
-    // 5.5. BTC PRICE — external reference (best-effort, non-blocking)
-    let btc_price = fetch_btc_price(price_feed).await;
+    // 5.5. WEATHER — external forecast (best-effort, non-blocking)
+    let weather = match weather_feed.forecast().await {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("Weather forecast failed: {}", e);
+            None
+        }
+    };
 
     // 6. BRAIN — one AI call
     let context = DecisionContext {
@@ -95,7 +101,7 @@ pub async fn run_cycle(
         last_n_trades: ledger.iter().rev().take(20).cloned().collect(),
         market: market.clone(),
         orderbook,
-        btc_price,
+        weather,
     };
 
     let decision = brain.decide(&context).await?;
@@ -185,32 +191,4 @@ pub async fn run_cycle(
 
     // 10. EXIT
     Ok(())
-}
-
-async fn fetch_btc_price(price_feed: &dyn PriceFeed) -> Option<PriceSnapshot> {
-    let symbol = "BTCUSDT";
-
-    let (candles_1m, candles_5m, spot) = tokio::join!(
-        price_feed.candles(symbol, "1m", 15),
-        price_feed.candles(symbol, "5m", 12),
-        price_feed.spot_price(symbol),
-    );
-
-    let candles_1m = candles_1m.ok().flatten()?;
-    let candles_5m = candles_5m.ok().flatten()?;
-    let spot = spot.ok().flatten()?;
-
-    if candles_1m.is_empty() {
-        tracing::warn!("Binance returned empty 1m candles");
-        return None;
-    }
-
-    let ind = indicators::compute(&candles_1m, &candles_5m, spot);
-
-    Some(PriceSnapshot {
-        candles_1m,
-        candles_5m,
-        spot_price: spot,
-        indicators: ind,
-    })
 }
