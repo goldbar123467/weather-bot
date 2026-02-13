@@ -1,8 +1,8 @@
-# CLAUDE.md — Kalshi BTC 15-Min Trading Bot (Rust)
+# CLAUDE.md — Kalshi Weather Trading Bot (Rust)
 
 ## What This Is
 
-A Rust cron job that runs every 15 minutes, asks Claude Opus 4.6 whether to buy YES or NO on Kalshi's BTC Up/Down 15-minute binary contract, places the order, and exits. Stats are computed deterministically in Rust. The AI never writes files. Hexagonal architecture so every external boundary is a swappable trait.
+A Rust cron job that fetches weather forecasts from NWS + Open-Meteo ensemble models, compares ensemble probabilities against Kalshi market prices for daily high temperature contracts, and trades when it finds an edge. Pure deterministic strategy — no LLM calls, $0/cycle.
 
 ## Architecture
 
@@ -11,41 +11,40 @@ A Rust cron job that runs every 15 minutes, asks Claude Opus 4.6 whether to buy 
                     │         CORE DOMAIN          │
                     │  (pure Rust, no IO, no deps) │
                     │                              │
+                    │  • engine.rs  (10-step cycle) │
+                    │  • rules_brain.rs (strategy)  │
+                    │  • indicators.rs (helpers)    │
                     │  • risk.rs    (limit checks)  │
                     │  • stats.rs   (ledger math)   │
                     │  • types.rs   (domain types)  │
-                    │  • engine.rs  (orchestration)  │
                     └──────────┬──────────────────┘
                                │ uses traits (ports)
-            ┌──────────────────┼──────────────────────┐
-            │                  │                       │
-    ┌───────▼──────┐   ┌──────▼───────┐   ┌──────────▼────────┐
-    │  Port:       │   │  Port:       │   │  Port:            │
-    │  Exchange    │   │  Brain       │   │  Notifier         │
-    │              │   │              │   │                    │
-    │  • market()  │   │  • decide()  │   │  • alert()        │
-    │  • orderbook │   │              │   │                    │
-    │  • order()   │   │              │   │                    │
-    │  • positions │   │              │   │                    │
-    │  • cancel()  │   │              │   │                    │
-    │  • settle()  │   │              │   │                    │
-    │  • balance() │   │              │   │                    │
-    └───────┬──────┘   └──────┬───────┘   └──────────┬────────┘
-            │                 │                       │
-    ┌───────▼──────┐   ┌──────▼───────┐   ┌──────────▼────────┐
-    │  Adapter:    │   │  Adapter:    │   │  Adapter:         │
-    │  KalshiApi   │   │  OpenRouter  │   │  Telegram         │
-    └──────────────┘   └──────────────┘   └───────────────────┘
-
-    Storage is plain filesystem — read/append to markdown files.
-    Not behind a trait in v1. Promote to trait when you need SQLite.
+            ┌──────────────────┼──────────────────┐
+            │                  │                   │
+    ┌───────▼──────┐   ┌──────▼───────┐   ┌──────▼────────┐
+    │  Port:       │   │  Port:       │   │  Port:        │
+    │  Exchange    │   │  Brain       │   │  WeatherFeed  │
+    │              │   │              │   │               │
+    │  • market()  │   │  • decide()  │   │  • forecast() │
+    │  • orderbook │   │              │   │               │
+    │  • order()   │   └──────┬───────┘   └──────┬────────┘
+    │  • positions │          │                   │
+    │  • cancel()  │   ┌──────▼───────┐   ┌──────▼────────┐
+    │  • settle()  │   │  Adapter:    │   │  Adapter:     │
+    │  • balance() │   │  RulesBrain  │   │  WeatherClient│
+    └───────┬──────┘   │  (pure core) │   │  (NWS+OM)    │
+            │          └──────────────┘   └───────────────┘
+    ┌───────▼──────┐
+    │  Adapter:    │
+    │  KalshiApi   │   Storage: plain filesystem — read/append markdown files.
+    └──────────────┘
 ```
 
 ### Why Hexagonal
 
 - **Testing**: Mock every adapter. Core domain is pure functions — unit test with zero network.
-- **Expansion**: New exchange? Implement `Exchange` trait. Swap AI? Implement `Brain` trait. Add Discord? Implement `Notifier` trait.
-- **Clarity**: If it touches the network, it's an adapter. If it's pure logic, it's core. No ambiguity.
+- **Swappable**: New exchange → implement `Exchange`. Want LLM back → swap `RulesBrain` for `OpenRouterClient`. New weather API → implement `WeatherFeed`.
+- **Clarity**: Network → adapter. Pure logic → core. No ambiguity.
 
 ## Tech Stack
 
@@ -61,41 +60,37 @@ A Rust cron job that runs every 15 minutes, asks Claude Opus 4.6 whether to buy 
 ## Project Structure
 
 ```
-kalshi-bot/
+weather-bot/
 ├── Cargo.toml
-├── .env
-├── .gitignore
+├── .env                             # Kalshi creds + weather config
 ├── CLAUDE.md
 ├── brain/
-│   ├── prompt.md                 # Static system prompt (you edit, AI reads)
-│   ├── ledger.md                 # Append-only trade log (Rust writes, AI reads)
-│   └── stats.md                  # Computed stats (Rust writes, AI reads)
+│   ├── prompt.md                    # Strategy reference (for LLM adapter if re-enabled)
+│   ├── ledger.md                    # Append-only trade log (Rust writes)
+│   └── stats.md                     # Computed stats (Rust writes)
 ├── src/
-│   ├── main.rs                   # Entry point — wires adapters, startup checks, lockfile
-│   ├── safety.rs                 # Lockfile, startup validation, live-mode gate
+│   ├── main.rs                      # Entry point — wires adapters, lockfile
+│   ├── safety.rs                    # Lockfile, startup validation, live-mode gate
+│   ├── storage.rs                   # Read/write brain/*.md files
 │   ├── core/
-│   │   ├── mod.rs
-│   │   ├── engine.rs             # Orchestration: the 10-step cycle
-│   │   ├── risk.rs               # Pure risk checks — no IO
-│   │   ├── stats.rs              # Compute stats from ledger — no IO
-│   │   └── types.rs              # All domain types, enums, structs
+│   │   ├── engine.rs                # Orchestration: the 10-step cycle
+│   │   ├── rules_brain.rs           # Deterministic: ensemble prob vs market implied
+│   │   ├── indicators.rs            # forecast_agreement(), ensemble_summary()
+│   │   ├── risk.rs                  # Pure risk checks — no IO
+│   │   ├── stats.rs                 # Compute stats from ledger — no IO
+│   │   └── types.rs                 # All domain types, enums, structs
 │   ├── ports/
-│   │   ├── mod.rs
-│   │   ├── exchange.rs           # Exchange trait
-│   │   ├── brain.rs              # Brain trait
-│   │   └── notifier.rs           # Notifier trait
-│   ├── adapters/
-│   │   ├── mod.rs
-│   │   ├── kalshi/
-│   │   │   ├── mod.rs
-│   │   │   ├── auth.rs           # RSA-PSS signing
-│   │   │   ├── client.rs         # Implements Exchange trait
-│   │   │   └── types.rs          # Kalshi-specific API response structs
-│   │   ├── openrouter.rs         # Implements Brain trait
-│   │   └── telegram.rs           # Implements Notifier trait
-│   └── storage.rs                # Read/write brain/*.md files
+│   │   ├── exchange.rs              # Exchange trait
+│   │   ├── brain.rs                 # Brain trait
+│   │   └── weather_feed.rs          # WeatherFeed trait
+│   └── adapters/
+│       ├── kalshi/
+│       │   ├── auth.rs              # RSA-PSS signing
+│       │   ├── client.rs            # Implements Exchange trait
+│       │   └── types.rs             # Kalshi API response structs
+│       ├── weather.rs               # NWS + Open-Meteo (implements WeatherFeed)
+│       └── openrouter.rs            # LLM adapter (preserved, not wired)
 └── logs/
-    └── .gitkeep
 ```
 
 ## Ports (Traits)
@@ -109,9 +104,9 @@ pub trait Exchange: Send + Sync {
     async fn orderbook(&self, ticker: &str) -> Result<Orderbook>;
     async fn resting_orders(&self) -> Result<Vec<RestingOrder>>;
     async fn cancel_order(&self, order_id: &str) -> Result<()>;
-    async fn place_order(&self, order: &OrderRequest) -> Result<String>;
+    async fn place_order(&self, order: &OrderRequest) -> Result<OrderResult>;
     async fn positions(&self) -> Result<Vec<Position>>;
-    async fn settlements(&self, since: &str) -> Result<Vec<Settlement>>;
+    async fn settlements(&self, ticker: &str) -> Result<Vec<Settlement>>;
     async fn balance(&self) -> Result<u64>;
 }
 ```
@@ -125,12 +120,12 @@ pub trait Brain: Send + Sync {
 }
 ```
 
-### ports/notifier.rs
+### ports/weather_feed.rs
 
 ```rust
 #[async_trait]
-pub trait Notifier: Send + Sync {
-    async fn alert(&self, message: &str) -> Result<()>;
+pub trait WeatherFeed: Send + Sync {
+    async fn forecast(&self) -> Result<Option<WeatherSnapshot>>;
 }
 ```
 
@@ -138,14 +133,39 @@ pub trait Notifier: Send + Sync {
 
 1. **CANCEL** stale resting orders from previous cycles
 2. **SETTLE** — check if previous trade settled, update ledger + stats
-3. **RISK** — deterministic checks (balance, daily loss, streak, open position)
-4. **MARKET** — fetch active market by series ticker
+3. **RISK** — deterministic checks (balance, daily loss, streak)
+4. **MARKET** — fetch active market by series ticker (e.g. `KXHIGHNY`)
 5. **ORDERBOOK** — fetch orderbook depth
-6. **BRAIN** — one AI call with full context
-7. **VALIDATE** — clamp shares/price, handle PASS
-8. **FINAL POSITION CHECK** — abort if position appeared during AI call
-9. **EXECUTE** — order first, ledger second (never phantom trades)
-10. **EXIT**
+6. **WEATHER** — fetch NWS + Open-Meteo deterministic + ensemble (concurrent)
+7. **BRAIN** — deterministic rules: ensemble probability vs market implied price
+8. **VALIDATE** — clamp shares/price, handle PASS
+9. **FINAL POSITION CHECK** — abort if position appeared during weather fetch
+10. **EXECUTE** — order first, ledger second (never phantom trades)
+
+## Strategy — RulesBrain
+
+The deterministic brain in `src/core/rules_brain.rs`:
+
+1. **Parse market type** from Kalshi ticker: `KXHIGHNY-26FEB12-T39` → `Above(39.0)` threshold
+2. **Compute ensemble YES probability**: sum ensemble member highs above threshold
+3. **Compare to market implied**: `yes_ask / 100`
+4. **Apply confidence weighting**: High (std dev <2°F) → 1.0x, Medium (2-4°F) → 0.8x, Low (>4°F) → 0.5x
+5. **Pick best side**: whichever of YES/NO has larger adjusted edge
+6. **Trade or PASS**: adjusted edge ≥ 5pp and price ≤ 50¢ → BUY, else PASS
+7. **Size**: 5-9pp → 1 share, 10-15pp → 2 shares (max_shares=2)
+8. **Price**: spread-aware — narrow ≤4¢ → pay ask, wide → midpoint
+
+Fallback: if no ensemble data, uses sigmoid of (forecast_high - threshold) as probability estimate.
+
+## Weather Data Sources
+
+| Source | Endpoint | Data | Required? |
+|--------|----------|------|-----------|
+| Open-Meteo deterministic | `api.open-meteo.com/v1/forecast` | Current temp, hourly trajectory, daily high | Yes |
+| Open-Meteo ensemble | `ensemble-api.open-meteo.com/v1/ensemble` | ICON + GFS + ECMWF members → bucket probabilities | Best-effort |
+| NWS | `api.weather.gov/points/{lat},{lon}` | Official forecast high/low, conditions | Best-effort |
+
+All 3 run concurrently via `tokio::join!`. Ensemble failure → sigmoid fallback. NWS failure → continue without.
 
 ## Risk Limits (hardcoded defaults)
 
@@ -154,15 +174,17 @@ pub trait Notifier: Send + Sync {
 - max_consecutive_losses: 7
 - min_balance_cents: 500 ($5)
 - min_minutes_to_expiry: 2.0
+- max price per share: 50¢ (enforced in rules_brain)
 
 ## Safety
 
-- **Lockfile**: `/tmp/kalshi-bot.lock` — PID-based, prevents double execution from cron overlap
+- **Lockfile**: `/tmp/kalshi-bot.lock` — PID-based, prevents double execution
 - **Live mode gate**: PAPER_TRADE=true by default; must set CONFIRM_LIVE=true to go live
 - **Startup validation**: Checks all config before any network calls
 - **Ledger backup**: `brain/ledger.md.bak` before every write
 - **Atomic stats**: Write to `.tmp` then rename
 - **Order-first**: Order placed before ledger write; if order fails, ledger stays clean
+- **50¢ cap**: Never pays more than 50¢ — guarantees ≥1:1 R/R
 
 ## Kalshi Auth
 
@@ -174,7 +196,6 @@ Handles both PKCS#1 and PKCS#8 PEM formats.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/trade-api/v2/exchange/status` | GET | Verify exchange is open |
 | `/trade-api/v2/markets` | GET | Market discovery |
 | `/trade-api/v2/markets/{ticker}/orderbook` | GET | Orderbook |
 | `/trade-api/v2/portfolio/orders` | GET | Resting orders |
@@ -189,30 +210,29 @@ Handles both PKCS#1 and PKCS#8 PEM formats.
 - **Production**: `https://api.elections.kalshi.com`
 - **Demo**: `https://demo-api.kalshi.co`
 
-## OpenRouter / Brain
+## Config (.env)
 
-- Model: `anthropic/claude-opus-4-6` (or `anthropic/claude-sonnet-4-5-20250929` for cost savings)
-- Parse fail = PASS (never trade on garbage)
-- ~$0.05/cycle, ~$5/day at 96 cycles
+```bash
+KALSHI_API_KEY_ID=your-uuid
+KALSHI_PRIVATE_KEY_PATH=./kalshi_private_key.pem
+KALSHI_BASE_URL=https://api.elections.kalshi.com
+KALSHI_SERIES_TICKER=KXHIGHNY
+
+WEATHER_CITY="New York"
+WEATHER_LAT=40.7128
+WEATHER_LON=-74.0060
+WEATHER_TIMEZONE=America/New_York
+
+PAPER_TRADE=false
+CONFIRM_LIVE=true
+```
 
 ## Cron
 
 ```bash
-1,16,31,46 * * * * cd /path/to/kalshi-bot && ./target/release/kalshi-bot >> logs/cron.log 2>&1
+0 8,10,12,14,16 * * * cd /path/to/weather-bot && RUST_LOG=info ./target/release/kalshi-bot >> logs/cron.log 2>&1
 ```
 
-## First Run — Discover Series Ticker
+## Cost
 
-Query `/trade-api/v2/markets?status=open&limit=200`, filter for BTC + 15-min titles, note the `series_ticker`, put it in `.env`.
-
-## What's NOT in v1
-
-- AI writing to any file
-- Confidence scores
-- External BTC price feeds
-- Debug/self-critique AI loop
-- WebSocket streaming
-- Multiple positions
-- Early exit / selling
-
-All are v2+ features that plug into existing traits.
+$0 per cycle. No LLM. Free weather APIs. Only cost is Kalshi trading fees.
