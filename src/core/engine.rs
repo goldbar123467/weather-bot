@@ -340,7 +340,7 @@ fn should_skip_settled_event(event_ticker: &str, timezone: &str) -> bool {
     };
     let event_date = format!("20{:02}-{:02}-{:02}", year_suffix, month, day);
     let offset_hours: i32 = match timezone {
-        "America/New_York" | "US/Eastern" => -5,
+        "America/New_York" | "US/Eastern" | "America/Indiana/Indianapolis" => -5,
         "America/Chicago" | "US/Central" => -6,
         "America/Denver" | "US/Mountain" => -7,
         "America/Los_Angeles" | "US/Pacific" => -8,
@@ -349,5 +349,5 @@ fn should_skip_settled_event(event_ticker: &str, timezone: &str) -> bool {
     let offset = chrono::FixedOffset::east_opt(offset_hours * 3600).unwrap();
     let local_now = chrono::Utc::now().with_timezone(&offset);
     let today = local_now.format("%Y-%m-%d").to_string();
-    event_date == today && local_now.hour() >= 17
+    event_date < today || (event_date == today && local_now.hour() >= 17)
 }

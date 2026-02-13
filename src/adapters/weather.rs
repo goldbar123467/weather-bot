@@ -16,7 +16,7 @@ pub struct WeatherClient {
 /// relative to that timezone, not the server's local time.
 fn today_in_timezone(tz: &str) -> String {
     let offset_hours: i32 = match tz {
-        "America/New_York" | "US/Eastern" => -5,
+        "America/New_York" | "US/Eastern" | "America/Indiana/Indianapolis" => -5,
         "America/Chicago" | "US/Central" => -6,
         "America/Denver" | "US/Mountain" => -7,
         "America/Los_Angeles" | "US/Pacific" => -8,
