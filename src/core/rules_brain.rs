@@ -43,6 +43,14 @@ impl Brain for RulesBrain {
             yes_ask, no_ask, market_implied * 100.0
         );
 
+        // Skip extreme prices — likely settled or stale
+        if market_implied > 0.90 || market_implied < 0.10 {
+            return Ok(pass(&format!(
+                "Extreme price: yes_ask={}¢ (implied {:.0}%) — likely settled or stale",
+                yes_ask, market_implied * 100.0
+            )));
+        }
+
         // Compute ensemble YES probability — prefer raw member highs, fall back to buckets
         let ensemble_yes = match &market_type {
             Some(mt) => {
