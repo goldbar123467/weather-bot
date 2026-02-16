@@ -260,16 +260,8 @@ fn estimate_fee_pp(shares: u32, price_cents: u32) -> f64 {
     fee_per_contract * shares as f64 / (shares as f64 * 100.0)
 }
 
-fn size_from_edge(edge: f64) -> u32 {
-    if edge >= 0.15 {
-        4
-    } else if edge >= 0.10 {
-        3
-    } else if edge >= 0.05 {
-        1
-    } else {
-        1
-    }
+fn size_from_edge(_edge: f64) -> u32 {
+    25
 }
 
 fn spread_aware_price(market: &MarketState, orderbook: &Orderbook, side: &Side) -> u32 {
