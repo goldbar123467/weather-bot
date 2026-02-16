@@ -17,7 +17,11 @@ async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
     let config = Config::from_env()?;
-    tracing::info!("paper_trade={} confirm_live={}", config.paper_trade, config.confirm_live);
+    let city_names: Vec<&str> = config.cities.iter().map(|c| c.name.as_str()).collect();
+    tracing::info!(
+        "paper_trade={} confirm_live={} cities=[{}]",
+        config.paper_trade, config.confirm_live, city_names.join(", ")
+    );
 
     safety::validate_startup(&config)?;
 
@@ -25,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
 
     let exchange = KalshiClient::new(&config)?;
     let brain = RulesBrain::new();
-    let weather_feed = WeatherClient::new(&config)?;
+    let weather_feed = WeatherClient::new()?;
 
     core::engine::run_cycle(&exchange, &brain, &weather_feed, &config).await
 }

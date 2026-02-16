@@ -5,10 +5,6 @@ use async_trait::async_trait;
 
 pub struct WeatherClient {
     client: reqwest::Client,
-    lat: f64,
-    lon: f64,
-    city: String,
-    timezone: String,
 }
 
 /// Compute "today" in the configured timezone using a UTC offset.
@@ -36,22 +32,18 @@ fn today_in_timezone(tz: &str) -> String {
 }
 
 impl WeatherClient {
-    pub fn new(config: &Config) -> Result<Self> {
+    pub fn new() -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
                 .build()?,
-            lat: config.weather_lat,
-            lon: config.weather_lon,
-            city: config.weather_city.clone(),
-            timezone: config.weather_timezone.clone(),
         })
     }
 
-    async fn fetch_nws(&self) -> Option<(Option<f64>, Option<f64>, Option<String>)> {
+    async fn fetch_nws(&self, lat: f64, lon: f64) -> Option<(Option<f64>, Option<f64>, Option<String>)> {
         let points_url = format!(
             "https://api.weather.gov/points/{:.4},{:.4}",
-            self.lat, self.lon
+            lat, lon
         );
 
         let points_resp = self
@@ -107,10 +99,10 @@ impl WeatherClient {
         Some((high, low, short_forecast))
     }
 
-    async fn fetch_open_meteo_deterministic(&self) -> Result<OpenMeteoDeterministic> {
+    async fn fetch_open_meteo_deterministic(&self, lat: f64, lon: f64, timezone: &str) -> Result<OpenMeteoDeterministic> {
         let url = format!(
             "https://api.open-meteo.com/v1/forecast?latitude={}&longitude={}&hourly=temperature_2m&current=temperature_2m&temperature_unit=fahrenheit&timezone={}&forecast_days=2",
-            self.lat, self.lon, self.timezone
+            lat, lon, timezone
         );
 
         let resp = self.client.get(&url).send().await?.json::<serde_json::Value>().await?;
@@ -126,7 +118,7 @@ impl WeatherClient {
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("Missing hourly temps"))?;
 
-        let today = today_in_timezone(&self.timezone);
+        let today = today_in_timezone(timezone);
 
         let mut hourly = Vec::new();
         let mut daily_high: f64 = f64::NEG_INFINITY;
@@ -157,10 +149,10 @@ impl WeatherClient {
         })
     }
 
-    async fn fetch_open_meteo_ensemble(&self) -> Option<(EnsembleForecast, Vec<TempBucketProbability>, Vec<f64>)> {
+    async fn fetch_open_meteo_ensemble(&self, lat: f64, lon: f64, timezone: &str) -> Option<(EnsembleForecast, Vec<TempBucketProbability>, Vec<f64>)> {
         let url = format!(
             "https://ensemble-api.open-meteo.com/v1/ensemble?latitude={}&longitude={}&hourly=temperature_2m&models=icon_seamless,gfs_seamless,ecmwf_ifs025,ecmwf_aifs025,gem_global&temperature_unit=fahrenheit&timezone={}&forecast_days=2",
-            self.lat, self.lon, self.timezone
+            lat, lon, timezone
         );
 
         let resp = self.client.get(&url).send().await.ok()?;
@@ -170,7 +162,7 @@ impl WeatherClient {
         }
 
         let data: serde_json::Value = resp.json().await.ok()?;
-        let today = today_in_timezone(&self.timezone);
+        let today = today_in_timezone(timezone);
 
         let mut all_highs: Vec<f64> = Vec::new();
 
@@ -269,11 +261,11 @@ struct OpenMeteoDeterministic {
 
 #[async_trait]
 impl WeatherFeed for WeatherClient {
-    async fn forecast(&self) -> Result<Option<WeatherSnapshot>> {
+    async fn forecast(&self, city: &CityConfig) -> Result<Option<WeatherSnapshot>> {
         let (nws_result, deterministic_result, ensemble_result) = tokio::join!(
-            self.fetch_nws(),
-            self.fetch_open_meteo_deterministic(),
-            self.fetch_open_meteo_ensemble(),
+            self.fetch_nws(city.lat, city.lon),
+            self.fetch_open_meteo_deterministic(city.lat, city.lon, &city.timezone),
+            self.fetch_open_meteo_ensemble(city.lat, city.lon, &city.timezone),
         );
 
         let det = match deterministic_result {
@@ -308,7 +300,7 @@ impl WeatherFeed for WeatherClient {
         };
 
         Ok(Some(WeatherSnapshot {
-            city: self.city.clone(),
+            city: city.name.clone(),
             current_temp_f: det.current_temp,
             nws_forecast_high: nws_high,
             nws_forecast_low: nws_low,

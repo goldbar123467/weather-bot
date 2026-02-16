@@ -220,6 +220,48 @@ pub struct LedgerRow {
     pub order_id: String,
 }
 
+// ── City Config ──
+
+#[derive(Debug, Clone)]
+pub struct CityConfig {
+    pub name: String,
+    pub series_ticker: String,
+    pub lat: f64,
+    pub lon: f64,
+    pub timezone: String,
+}
+
+impl CityConfig {
+    pub fn all() -> Vec<CityConfig> {
+        vec![
+            CityConfig {
+                name: "New York".into(),
+                series_ticker: "KXHIGHNY".into(),
+                lat: 40.7128, lon: -74.0060,
+                timezone: "America/New_York".into(),
+            },
+            CityConfig {
+                name: "Chicago".into(),
+                series_ticker: "KXHIGHCHI".into(),
+                lat: 41.8781, lon: -87.6298,
+                timezone: "America/Chicago".into(),
+            },
+            CityConfig {
+                name: "Miami".into(),
+                series_ticker: "KXHIGHMI".into(),
+                lat: 25.7617, lon: -80.1918,
+                timezone: "America/New_York".into(),
+            },
+            CityConfig {
+                name: "Austin".into(),
+                series_ticker: "KXHIGHAT".into(),
+                lat: 30.2672, lon: -97.7431,
+                timezone: "America/Chicago".into(),
+            },
+        ]
+    }
+}
+
 // ── Config ──
 
 pub struct Config {
@@ -230,16 +272,12 @@ pub struct Config {
     pub min_minutes_to_expiry: f64,
     pub paper_trade: bool,
     pub confirm_live: bool,
-    pub series_ticker: String,
     pub kalshi_base_url: String,
     pub openrouter_api_key: String,
     pub kalshi_key_id: String,
     pub kalshi_private_key_pem: String,
     pub lockfile_path: String,
-    pub weather_city: String,
-    pub weather_lat: f64,
-    pub weather_lon: f64,
-    pub weather_timezone: String,
+    pub cities: Vec<CityConfig>,
 }
 
 impl Config {
@@ -247,6 +285,21 @@ impl Config {
         let pem_path = std::env::var("KALSHI_PRIVATE_KEY_PATH")
             .unwrap_or_else(|_| "./kalshi_private_key.pem".into());
         let pem = std::fs::read_to_string(&pem_path).unwrap_or_default();
+
+        let all_cities = CityConfig::all();
+        let cities = match std::env::var("CITIES") {
+            Ok(filter) => {
+                let allowed: Vec<&str> = filter.split(',').map(|s| s.trim()).collect();
+                all_cities.into_iter()
+                    .filter(|c| allowed.contains(&c.series_ticker.as_str()))
+                    .collect()
+            }
+            Err(_) => all_cities,
+        };
+
+        if cities.is_empty() {
+            anyhow::bail!("No valid cities configured");
+        }
 
         Ok(Self {
             max_shares: 2,
@@ -260,25 +313,13 @@ impl Config {
             confirm_live: std::env::var("CONFIRM_LIVE")
                 .map(|v| v == "true")
                 .unwrap_or(false),
-            series_ticker: std::env::var("KALSHI_SERIES_TICKER").unwrap_or_default(),
             kalshi_base_url: std::env::var("KALSHI_BASE_URL")
                 .unwrap_or_else(|_| "https://api.elections.kalshi.com".into()),
             openrouter_api_key: std::env::var("OPENROUTER_API_KEY").unwrap_or_default(),
             kalshi_key_id: std::env::var("KALSHI_API_KEY_ID").unwrap_or_default(),
             kalshi_private_key_pem: pem,
             lockfile_path: "/tmp/kalshi-bot.lock".into(),
-            weather_city: std::env::var("WEATHER_CITY")
-                .unwrap_or_else(|_| "New York".into()),
-            weather_lat: std::env::var("WEATHER_LAT")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(40.7128),
-            weather_lon: std::env::var("WEATHER_LON")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(-74.0060),
-            weather_timezone: std::env::var("WEATHER_TIMEZONE")
-                .unwrap_or_else(|_| "America/New_York".into()),
+            cities,
         })
     }
 }

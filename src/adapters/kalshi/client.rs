@@ -10,7 +10,6 @@ pub struct KalshiClient {
     client: reqwest::Client,
     auth: KalshiAuth,
     base_url: String,
-    series_ticker: String,
 }
 
 impl KalshiClient {
@@ -23,7 +22,6 @@ impl KalshiClient {
             client: reqwest::Client::new(),
             auth,
             base_url: config.kalshi_base_url.clone(),
-            series_ticker: config.series_ticker.clone(),
         })
     }
 
@@ -97,15 +95,10 @@ impl KalshiClient {
 
 #[async_trait]
 impl Exchange for KalshiClient {
-    async fn active_market(&self) -> Result<Option<MarketState>> {
-        let markets = self.active_markets().await?;
-        Ok(markets.into_iter().next())
-    }
-
-    async fn active_markets(&self) -> Result<Vec<MarketState>> {
+    async fn active_markets_for_series(&self, series_ticker: &str) -> Result<Vec<MarketState>> {
         let path = format!(
             "/trade-api/v2/markets?series_ticker={}&status=open",
-            self.series_ticker
+            series_ticker
         );
         let resp: MarketsResponse = self.get(&path).await?;
 

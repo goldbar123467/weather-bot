@@ -20,12 +20,15 @@ pub async fn run_cycle(
         tracing::info!("Canceled stale order: {} (ledger marked cancelled)", order.order_id);
     }
 
-    // 2. SETTLE — check if previous trade settled, update ledger + stats
+    // 2. SETTLE — check ALL pending trades (may have multiple cities)
     let mut ledger = storage::read_ledger()?;
-    if let Some(pending) = ledger.iter().rev().find(|r| r.result == "pending") {
-        let pending_ticker = pending.ticker.clone();
-        let pending_timestamp = pending.timestamp.clone();
-        let settlements = exchange.settlements(&pending_ticker).await?;
+    let pending_entries: Vec<(String, String)> = ledger.iter().rev()
+        .filter(|r| r.result == "pending")
+        .map(|r| (r.ticker.clone(), r.timestamp.clone()))
+        .collect();
+
+    for (pending_ticker, pending_timestamp) in &pending_entries {
+        let settlements = exchange.settlements(pending_ticker).await?;
         if let Some(s) = settlements.first() {
             storage::settle_last_trade(s)?;
             ledger = storage::read_ledger()?;
@@ -37,7 +40,7 @@ pub async fn run_cycle(
             );
         } else {
             // No settlement found — check if pending entry is stale (>30 min old)
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&pending_timestamp) {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(pending_timestamp) {
                 let age_min = (chrono::Utc::now() - ts.with_timezone(&chrono::Utc)).num_minutes();
                 if age_min > 30 {
                     let zombie = Settlement {
@@ -70,66 +73,96 @@ pub async fn run_cycle(
         return Ok(());
     }
 
-    // 4. MARKETS — fetch all brackets for nearest event
-    let brackets = exchange.active_markets().await?;
-    if brackets.is_empty() {
-        tracing::info!("No active markets");
-        return Ok(());
+    // 4+ PER-CITY EVALUATION
+    let positions = exchange.positions().await?;
+    let prompt_md = storage::read_prompt()?;
+    let mut trades_this_cycle = 0u32;
+
+    for city in &config.cities {
+        tracing::info!("━━━ {} ({}) ━━━", city.name, city.series_ticker);
+
+        match run_city(exchange, brain, weather_feed, config, city, &ledger, &positions, &prompt_md).await {
+            Ok(traded) => {
+                if traded {
+                    trades_this_cycle += 1;
+                    ledger = storage::read_ledger()?;
+                }
+            }
+            Err(e) => {
+                tracing::error!("[{}] Failed: {} — continuing", city.name, e);
+            }
+        }
     }
 
-    // Filter by min_minutes_to_expiry
+    tracing::info!("Cycle complete: {}/{} cities traded", trades_this_cycle, config.cities.len());
+    Ok(())
+}
+
+async fn run_city(
+    exchange: &dyn Exchange,
+    brain: &dyn Brain,
+    weather_feed: &dyn WeatherFeed,
+    config: &Config,
+    city: &CityConfig,
+    ledger: &[LedgerRow],
+    positions: &[Position],
+    prompt_md: &str,
+) -> Result<bool> {
+    // MARKETS — fetch all brackets for nearest event
+    let brackets = exchange.active_markets_for_series(&city.series_ticker).await?;
+    if brackets.is_empty() {
+        tracing::info!("[{}] No active markets", city.name);
+        return Ok(false);
+    }
+
     let mut brackets: Vec<MarketState> = brackets
         .into_iter()
         .filter(|m| m.minutes_to_expiry >= config.min_minutes_to_expiry)
         .collect();
 
     if brackets.is_empty() {
-        tracing::info!("All brackets too close to expiry");
-        return Ok(());
+        tracing::info!("[{}] All brackets too close to expiry", city.name);
+        return Ok(false);
     }
 
     // Skip events where the daily high is likely already known
-    if should_skip_settled_event(&brackets[0].event_ticker, &config.weather_timezone) {
+    if should_skip_settled_event(&brackets[0].event_ticker, &city.timezone) {
         let settled_event = brackets[0].event_ticker.clone();
-        tracing::info!("Event {} likely settled (past 5 PM local) — looking for next event", settled_event);
-        let all_markets = exchange.active_markets().await?;
+        tracing::info!("[{}] Event {} likely settled — looking for next", city.name, settled_event);
+        let all_markets = exchange.active_markets_for_series(&city.series_ticker).await?;
         let next: Vec<MarketState> = all_markets
             .into_iter()
             .filter(|m| m.event_ticker != settled_event && m.minutes_to_expiry >= config.min_minutes_to_expiry)
             .collect();
         if next.is_empty() {
-            tracing::info!("No next event available after skipping settled event");
-            return Ok(());
+            tracing::info!("[{}] No next event available", city.name);
+            return Ok(false);
         }
         brackets = next;
     }
 
     let event_ticker = brackets[0].event_ticker.clone();
     tracing::info!(
-        "Found {} brackets for event {} (expiry in {:.1}min)",
-        brackets.len(), event_ticker, brackets[0].minutes_to_expiry
+        "[{}] {} brackets for event {} (expiry in {:.1}min)",
+        city.name, brackets.len(), event_ticker, brackets[0].minutes_to_expiry
     );
 
-    // 5. EVENT-LEVEL POSITION CHECK — skip if ANY position on this event
-    let positions = exchange.positions().await?;
-    if positions.iter().any(|p| {
-        brackets.iter().any(|b| b.ticker == p.ticker)
-    }) {
-        tracing::warn!("Existing position on event {} — skipping entire event", event_ticker);
-        return Ok(());
+    // EVENT-LEVEL POSITION CHECK
+    if positions.iter().any(|p| brackets.iter().any(|b| b.ticker == p.ticker)) {
+        tracing::warn!("[{}] Existing position on event {} — skipping", city.name, event_ticker);
+        return Ok(false);
     }
 
-    // 6. WEATHER — fetch once, shared across all brackets
-    let weather = match weather_feed.forecast().await {
+    // WEATHER
+    let weather = match weather_feed.forecast(city).await {
         Ok(w) => w,
         Err(e) => {
-            tracing::warn!("Weather forecast failed: {}", e);
+            tracing::warn!("[{}] Weather forecast failed: {}", city.name, e);
             None
         }
     };
 
-    // 7. EVALUATE all brackets
-    let prompt_md = storage::read_prompt()?;
+    // EVALUATE all brackets
     let mut buy_candidates: Vec<(MarketState, Orderbook, TradeDecision)> = Vec::new();
     let mut scan_lines: Vec<String> = Vec::new();
 
@@ -137,8 +170,8 @@ pub async fn run_cycle(
         let orderbook = exchange.orderbook(&market.ticker).await?;
 
         let context = DecisionContext {
-            prompt_md: prompt_md.clone(),
-            stats: stats::compute(&ledger),
+            prompt_md: prompt_md.to_string(),
+            stats: stats::compute(ledger),
             last_n_trades: ledger.iter().rev().take(20).cloned().collect(),
             market: market.clone(),
             orderbook: orderbook.clone(),
@@ -147,7 +180,6 @@ pub async fn run_cycle(
 
         let decision = brain.decide(&context).await?;
 
-        // Build scan line for logging
         let market_type = MarketType::from_market(market);
         let mt_label = match &market_type {
             Some(MarketType::Above(t)) => format!(">{:.0}°", t),
@@ -210,23 +242,21 @@ pub async fn run_cycle(
             }
             let pct = covered as f64 / total as f64 * 100.0;
             if pct < 90.0 {
-                tracing::warn!("Bracket coverage: {:.0}% ({}/{} members) — gaps in bracket ranges", pct, covered, total);
+                tracing::warn!("[{}] Bracket coverage: {:.0}% ({}/{})", city.name, pct, covered, total);
             } else {
-                tracing::info!("Bracket coverage: {:.0}% ({}/{})", pct, covered, total);
+                tracing::info!("[{}] Bracket coverage: {:.0}% ({}/{})", city.name, pct, covered, total);
             }
         }
     }
 
-    // 8. LOG bracket scan table
-    tracing::info!("Bracket scan for {}:", event_ticker);
+    tracing::info!("[{}] Bracket scan for {}:", city.name, event_ticker);
     for line in &scan_lines {
         tracing::info!("{}", line);
     }
 
-    // 9. SELECT best bracket by edge_magnitude
     if buy_candidates.is_empty() {
-        tracing::info!("PASS: No bracket has sufficient edge");
-        return Ok(());
+        tracing::info!("[{}] PASS: No bracket has sufficient edge", city.name);
+        return Ok(false);
     }
 
     buy_candidates.sort_by(|a, b| {
@@ -239,34 +269,27 @@ pub async fn run_cycle(
     let price = best_decision.max_price_cents.unwrap_or(50).clamp(1, 99);
 
     tracing::info!(
-        "Best bracket: {} | edge={:.1}pp | {:?} {}x @ {}¢ (brain: {}x @ {}¢, max={})",
-        best_market.ticker, best_decision.edge_magnitude * 100.0,
-        side, shares, price,
-        best_decision.shares.unwrap_or(1), best_decision.max_price_cents.unwrap_or(50), config.max_shares
+        "[{}] Best: {} | edge={:.1}pp | {:?} {}x @ {}¢",
+        city.name, best_market.ticker, best_decision.edge_magnitude * 100.0,
+        side, shares, price
     );
-    tracing::info!("Reasoning: {}", best_decision.reasoning);
+    tracing::info!("[{}] Reasoning: {}", city.name, best_decision.reasoning);
 
-    // 10. FINAL POSITION CHECK (race condition guard)
+    // FINAL POSITION CHECK (race condition guard)
     let fresh_positions = exchange.positions().await?;
-    if fresh_positions.iter().any(|p| {
-        brackets.iter().any(|b| b.ticker == p.ticker)
-    }) {
-        tracing::warn!("Position appeared on event {} during evaluation — aborting", event_ticker);
-        return Ok(());
+    if fresh_positions.iter().any(|p| brackets.iter().any(|b| b.ticker == p.ticker)) {
+        tracing::warn!("[{}] Position appeared during evaluation — aborting", city.name);
+        return Ok(false);
     }
 
-    // 11. EXECUTE — order FIRST, ledger SECOND
-    let current_stats = stats::compute(&ledger);
+    // EXECUTE — order FIRST, ledger SECOND
+    let current_stats = stats::compute(ledger);
 
     if config.paper_trade {
         let paper_id = format!("paper-{}", chrono::Utc::now().timestamp_millis());
         tracing::info!(
-            "PAPER: {:?} {}x @ {}¢ | {} ({})",
-            side,
-            shares,
-            price,
-            best_market.ticker,
-            paper_id
+            "[{}] PAPER: {:?} {}x @ {}¢ | {} ({})",
+            city.name, side, shares, price, best_market.ticker, paper_id
         );
         storage::append_ledger(&LedgerRow {
             timestamp: chrono::Utc::now().to_rfc3339(),
@@ -292,8 +315,8 @@ pub async fn run_cycle(
         match order_result {
             Ok(result) => {
                 tracing::info!(
-                    "LIVE: {:?} {}x @ {}¢ | {} (order {} status: {})",
-                    side, shares, price, best_market.ticker, result.order_id, result.status
+                    "[{}] LIVE: {:?} {}x @ {}¢ | {} (order {} status: {})",
+                    city.name, side, shares, price, best_market.ticker, result.order_id, result.status
                 );
                 if let Err(e) = storage::append_ledger(&LedgerRow {
                     timestamp: chrono::Utc::now().to_rfc3339(),
@@ -315,13 +338,13 @@ pub async fn run_cycle(
                 }
             }
             Err(e) => {
-                tracing::error!("Order placement failed: {}", e);
+                tracing::error!("[{}] Order placement failed: {}", city.name, e);
                 return Err(e);
             }
         }
     }
 
-    Ok(())
+    Ok(true)
 }
 
 fn should_skip_settled_event(event_ticker: &str, timezone: &str) -> bool {

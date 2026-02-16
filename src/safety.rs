@@ -40,8 +40,8 @@ pub fn validate_startup(config: &Config) -> anyhow::Result<()> {
         anyhow::bail!("PEM file doesn't look like a private key");
     }
 
-    if config.series_ticker.is_empty() {
-        anyhow::bail!("KALSHI_SERIES_TICKER not set — run discovery first");
+    if config.cities.is_empty() {
+        anyhow::bail!("No cities configured — check CITIES env var");
     }
 
     if config.kalshi_key_id.is_empty() {

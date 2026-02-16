@@ -103,9 +103,9 @@ pub fn settle_last_trade(settlement: &Settlement) -> anyhow::Result<()> {
     let content = std::fs::read_to_string(path)?;
     let mut lines: Vec<String> = content.lines().map(|l| l.to_string()).collect();
 
-    // Find the last pending line and update it
+    // Find the last pending line matching this ticker and update it
     for line in lines.iter_mut().rev() {
-        if line.contains("| pending |") {
+        if line.contains("| pending |") && line.contains(&settlement.ticker) {
             let cols: Vec<&str> = line.split('|').map(|s| s.trim()).collect();
             if cols.len() >= 9 {
                 let shares: i64 = cols[4].parse().unwrap_or(1);
