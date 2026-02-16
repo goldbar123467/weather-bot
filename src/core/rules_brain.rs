@@ -261,7 +261,7 @@ fn estimate_fee_pp(shares: u32, price_cents: u32) -> f64 {
 }
 
 fn size_from_edge(_edge: f64) -> u32 {
-    25
+    50
 }
 
 fn spread_aware_price(market: &MarketState, orderbook: &Orderbook, side: &Side) -> u32 {

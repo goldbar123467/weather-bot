@@ -110,8 +110,11 @@ pub fn settle_last_trade(settlement: &Settlement) -> anyhow::Result<()> {
             if cols.len() >= 9 {
                 let shares: i64 = cols[4].parse().unwrap_or(1);
                 let price: i64 = cols[5].parse().unwrap_or(0);
-                let cost = price * shares;
-                let pnl = settlement.pnl_cents - cost;
+                let pnl = if settlement.result == "win" {
+                    (100 - price) * shares
+                } else {
+                    -(price * shares)
+                };
                 let prev_cumulative: i64 = cols[8].parse().unwrap_or(0);
                 let new_cumulative = prev_cumulative + pnl;
                 let order_id = if cols.len() >= 10 { cols[9] } else { "" };
